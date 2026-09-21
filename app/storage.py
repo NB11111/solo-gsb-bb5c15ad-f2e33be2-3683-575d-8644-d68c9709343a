@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 from . import config, db
@@ -42,6 +43,23 @@ def expected_chunk_size(session: sqlite3.Row, index: int) -> int:
 def final_path_for(session: sqlite3.Row) -> Path:
     name = f"{session['id']}_{sanitize_filename(session['filename'])}"
     return config.files_dir() / name
+
+
+def iter_file(path: Path, offset: int, length: int) -> Iterator[bytes]:
+    """Stream `length` bytes of `path` starting at `offset` in bounded reads.
+
+    Backs the download endpoint: only the requested range is touched, and the
+    1 MiB read buffer keeps memory use flat regardless of file or range size.
+    """
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        remaining = length
+        while remaining > 0:
+            buf = fh.read(min(_COPY_BUFFER, remaining))
+            if not buf:
+                return
+            remaining -= len(buf)
+            yield buf
 
 
 def reconcile() -> None:

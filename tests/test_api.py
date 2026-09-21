@@ -52,6 +52,18 @@ def _put(client: TestClient, sid: str, index: int, payload: bytes, digest: str |
     )
 
 
+def _completed_session(client: TestClient, data: bytes, chunk_size: int) -> dict:
+    """Drive a session through upload + merge and return the completed payload."""
+    session = _create(client, data, chunk_size)
+    sid = session["session_id"]
+    for index in range(session["total_chunks"]):
+        payload = data[index * chunk_size : (index + 1) * chunk_size]
+        assert _put(client, sid, index, payload).status_code == 200
+    done = client.post(f"/uploads/{sid}/complete")
+    assert done.status_code == 200, done.text
+    return done.json()
+
+
 def test_full_flow_out_of_order_with_retry():
     with TestClient(app) as client:
         chunk_size = 1024
@@ -152,3 +164,99 @@ def test_abort_session():
         assert _put(client, sid, 0, chunks[0]).status_code == 200
         assert client.delete(f"/uploads/{sid}").status_code == 204
         assert client.get(f"/uploads/{sid}").status_code == 404
+
+
+def test_download_full_and_single_ranges():
+    with TestClient(app) as client:
+        chunk_size = 512
+        data, _ = _make_file(chunk_size, total_chunks=4, last_size=300)
+        sid = _completed_session(client, data, chunk_size)["session_id"]
+        size = len(data)
+        etag = f'"{_sha256(data)}"'
+
+        resp = client.get(f"/uploads/{sid}/content")
+        assert resp.status_code == 200
+        assert resp.content == data
+        assert resp.headers["accept-ranges"] == "bytes"
+        assert resp.headers["content-length"] == str(size)
+        assert resp.headers["etag"] == etag
+
+        # HEAD reports the same metadata without a body.
+        head = client.head(f"/uploads/{sid}/content")
+        assert head.status_code == 200
+        assert head.headers["content-length"] == str(size)
+        assert head.headers["accept-ranges"] == "bytes"
+        assert head.content == b""
+
+        cases = [
+            ("bytes=10-19", data[10:20], f"bytes 10-19/{size}"),
+            (f"bytes={size - 5}-", data[-5:], f"bytes {size - 5}-{size - 1}/{size}"),
+            ("bytes=-7", data[-7:], f"bytes {size - 7}-{size - 1}/{size}"),
+            # End past the file is clamped; an oversized suffix means "all".
+            (f"bytes=0-{size + 100}", data, f"bytes 0-{size - 1}/{size}"),
+            (f"bytes=-{size + 100}", data, f"bytes 0-{size - 1}/{size}"),
+        ]
+        for header, body, content_range in cases:
+            resp = client.get(f"/uploads/{sid}/content", headers={"Range": header})
+            assert resp.status_code == 206, header
+            assert resp.content == body, header
+            assert resp.headers["content-range"] == content_range, header
+            assert resp.headers["content-length"] == str(len(body)), header
+            assert resp.headers["etag"] == etag, header
+
+
+def test_download_conditional_requests():
+    with TestClient(app) as client:
+        data, _ = _make_file(256, total_chunks=2, last_size=256)
+        sid = _completed_session(client, data, 256)["session_id"]
+        etag = f'"{_sha256(data)}"'
+        url = f"/uploads/{sid}/content"
+
+        # If-None-Match hit (exact, weak-prefixed, list member or *) → 304.
+        for header in (etag, f"W/{etag}", f'"{"0" * 64}", {etag}', "*"):
+            resp = client.get(url, headers={"If-None-Match": header})
+            assert resp.status_code == 304, header
+            assert resp.content == b""
+            assert resp.headers["etag"] == etag
+
+        # A non-matching validator is ignored → full download.
+        resp = client.get(url, headers={"If-None-Match": '"deadbeef"'})
+        assert resp.status_code == 200
+        assert resp.content == data
+
+        # If-Range gates the Range: match → 206, mismatch/weak → 200 in full.
+        resp = client.get(url, headers={"Range": "bytes=0-9", "If-Range": etag})
+        assert resp.status_code == 206
+        assert resp.content == data[:10]
+        for if_range in ('"deadbeef"', f"W/{etag}"):
+            resp = client.get(url, headers={"Range": "bytes=0-9", "If-Range": if_range})
+            assert resp.status_code == 200, if_range
+            assert resp.content == data, if_range
+
+
+def test_download_range_errors_and_state():
+    with TestClient(app) as client:
+        data, chunks = _make_file(256, total_chunks=2, last_size=100)
+        sid = _completed_session(client, data, 256)["session_id"]
+        size = len(data)
+        url = f"/uploads/{sid}/content"
+
+        bad_ranges = [
+            "bytes=0-1,4-5",  # multi-range sets are not supported
+            "bytes=abc",      # not a range at all
+            "items=0-1",      # unknown unit
+            "bytes=-",        # empty specifier
+            "bytes=-0",       # zero-length suffix
+            "bytes=5-2",      # start after end
+            f"bytes={size}-",  # starts past the end of the file
+        ]
+        for header in bad_ranges:
+            resp = client.get(url, headers={"Range": header})
+            assert resp.status_code == 416, header
+            assert resp.headers["content-range"] == f"bytes */{size}", header
+
+        # Unfinished sessions cannot be downloaded; unknown ids 404.
+        pending = _create(client, data, 256)["session_id"]
+        assert _put(client, pending, 0, chunks[0]).status_code == 200
+        assert client.get(f"/uploads/{pending}/content").status_code == 409
+        assert client.get("/uploads/nope/content").status_code == 404

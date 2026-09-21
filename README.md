@@ -5,6 +5,7 @@
 - 创建上传会话，按序号接收携带 **SHA-256** 校验的分片
 - 分片**乱序上传、失败重试**均可，重复上传幂等
 - 全部分片校验通过后才**原子合并**（临时文件 + `rename`）为目标文件
+- 成品文件支持**流式下载与单段字节 Range**，携带强 ETag，支持 `If-None-Match` / `If-Range` 条件请求
 - 查询接口实时返回**缺失分片列表**与会话状态
 - 元数据存 SQLite、分片存磁盘，**服务重启后可继续未完成会话**
 - 启动时自动初始化存储目录，默认监听 **8000** 端口
@@ -50,6 +51,7 @@ data/
 | PUT    | `/uploads/{id}/chunks/{index}`        | 上传一个分片（原始字节） |
 | GET    | `/uploads/{id}`                       | 查询状态与缺失分片       |
 | POST   | `/uploads/{id}/complete`              | 校验并原子合并           |
+| GET    | `/uploads/{id}/content`               | 下载成品文件（支持 Range） |
 | GET    | `/uploads`                            | 列出所有会话             |
 | DELETE | `/uploads/{id}`                       | 中止会话并清理           |
 | GET    | `/healthz`                            | 健康检查                 |
@@ -132,6 +134,37 @@ curl -X POST http://localhost:8000/uploads/$SID/complete
 
 `complete` 幂等：重复调用返回相同结果。整文件哈希不匹配返回 `422`，会话保持 `uploading`，可修正后重试。
 
+### 5. 下载成品文件（完整 / Range / 条件请求）
+
+会话 `completed` 后即可下载合并后的文件；未完成会话返回 `409`，未知会话返回 `404`。
+
+```bash
+# 完整下载（-OJ 让 curl 采用 Content-Disposition 中的文件名）
+curl -OJ http://localhost:8000/uploads/$SID/content
+
+# 单段字节区间：start-end / start- / -suffix 三种形式均可
+curl -H 'Range: bytes=0-1048575' http://localhost:8000/uploads/$SID/content
+
+# 断点续传：从已收到的字节处继续
+curl -C - -O http://localhost:8000/uploads/$SID/content
+
+# 条件请求：ETag 未变化时返回 304，不传输文件体
+ETAG=$(curl -sI http://localhost:8000/uploads/$SID/content | awk '/^[Ee][Tt][Aa][Gg]:/ {print $2}' | tr -d '\r')
+curl -H "If-None-Match: $ETAG" http://localhost:8000/uploads/$SID/content
+
+# 带校验的区间请求：ETag 不一致时忽略 Range，返回完整文件
+curl -H 'Range: bytes=0-1048575' -H "If-Range: $ETAG" http://localhost:8000/uploads/$SID/content
+```
+
+行为约定：
+
+- 响应恒带 `Accept-Ranges: bytes` 与**强 `ETag`**（值为整文件 SHA-256 加引号），`HEAD` 请求返回相同头部、无响应体
+- 命中 Range 时返回 `206`，携带 `Content-Range: bytes start-end/total` 与精确的 `Content-Length`；`end` 越界按文件末尾截断，`suffix` 超过文件长度则返回整个文件
+- `If-None-Match` 命中当前 ETag（支持列表、弱比较与 `*`）→ `304`
+- `If-Range` 与当前 ETag **强比较**一致时才按 Range 返回 `206`，否则忽略 Range 返回完整文件（`200`）
+- 多段区间（`bytes=0-1,3-4`）、语法错误、起点越过文件末尾等 → `416`，并携带 `Content-Range: bytes */总长度`
+- 下载全程按区间**流式读取**磁盘（1 MiB 缓冲），不会把文件整体载入内存
+
 ## 断点续传语义
 
 - 所有状态都在 `DATA_DIR` 内（SQLite + 分片文件），进程重启、容器重建（挂载同一 volume）后，未完成会话自动可用
@@ -145,7 +178,7 @@ pip install -r requirements-dev.txt
 pytest tests/
 ```
 
-测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止。
+测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止、完整/区间/条件下载（200/206/304/416/409/404）与 HEAD。
 
 ## 客户端示例（Python）
 

@@ -1,4 +1,4 @@
-"""FastAPI application: chunked, resumable, hash-verified file uploads."""
+"""FastAPI application: chunked, resumable, hash-verified uploads + downloads."""
 
 from __future__ import annotations
 
@@ -10,8 +10,10 @@ import shutil
 import threading
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import config, db, storage
@@ -71,6 +73,55 @@ def _get_session_or_404(session_id: str):
         if session is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
         return session
+
+
+_SINGLE_RANGE_RE = re.compile(r"bytes=\s*(\d*)\s*-\s*(\d*)", re.IGNORECASE)
+
+
+def _parse_single_range(header: str, size: int) -> tuple[int, int]:
+    """Parse one `bytes` range into an inclusive (start, end) pair.
+
+    Multi-range sets, malformed syntax and unsatisfiable ranges all raise
+    ValueError; the endpoint maps that to 416.
+    """
+    value = header.strip()
+    if "," in value:
+        raise ValueError("multiple ranges are not supported")
+    match = _SINGLE_RANGE_RE.fullmatch(value)
+    if match is None:
+        raise ValueError("unsupported Range syntax")
+    first, last = match.groups()
+    if not first and not last:
+        raise ValueError("empty range specifier")
+    if first:
+        start = int(first)
+        end = int(last) if last else size - 1
+        if start > end:
+            raise ValueError("range start is after range end")
+        if start >= size:
+            raise ValueError("range start is beyond the end of the file")
+        return start, min(end, size - 1)
+    suffix = int(last)
+    if suffix == 0:
+        raise ValueError("zero-length suffix range")
+    return max(size - suffix, 0), size - 1
+
+
+def _etag_list_matches(header: str, etag: str) -> bool:
+    """If-None-Match uses weak comparison; `*` matches any representation."""
+    for candidate in header.split(","):
+        candidate = candidate.strip()
+        if candidate.startswith("W/"):
+            candidate = candidate[2:].strip()
+        if candidate == "*" or candidate == etag:
+            return True
+    return False
+
+
+def _etag_strong_match(header: str, etag: str) -> bool:
+    """If-Range requires a strong comparison; weak tags and dates never match."""
+    candidate = header.strip()
+    return not candidate.startswith("W/") and candidate == etag
 
 
 # ---------------------------------------------------------------- endpoints
@@ -258,6 +309,78 @@ def complete_session(session_id: str) -> dict:
             )
     finally:
         lock.release()
+
+
+@app.api_route("/uploads/{session_id}/content", methods=["GET", "HEAD"])
+def download_content(
+    session_id: str,
+    request: Request,
+    range_header: str | None = Header(default=None, alias="range"),
+    if_none_match: str | None = Header(default=None),
+    if_range: str | None = Header(default=None),
+):
+    """Download the merged file, in full or as a single byte range.
+
+    Always emits Accept-Ranges and a strong ETag built from the file's SHA-256.
+    If-None-Match short-circuits to 304; If-Range gates whether a Range is
+    honoured (mismatch → full 200). Multi-range sets, bad syntax and
+    unsatisfiable ranges get 416 with `Content-Range: bytes */<size>`. Payload
+    bytes are streamed from disk in bounded reads, never buffered wholesale.
+    """
+    with db.connect() as conn:
+        session = db.get_session(conn, session_id)
+    if session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    if session["status"] != "completed":
+        raise HTTPException(status.HTTP_409_CONFLICT, "session is not completed yet")
+
+    path = Path(session["final_path"])
+    if not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "merged file is missing")
+
+    size = path.stat().st_size
+    etag = f'"{session["file_sha256"]}"'
+    headers = {
+        "Accept-Ranges": "bytes",
+        "ETag": etag,
+        "Content-Disposition": (
+            f'attachment; filename="{storage.sanitize_filename(session["filename"])}"'
+        ),
+    }
+
+    # Preconditions are evaluated before Range (RFC 9110 §13.2.2).
+    if if_none_match is not None and _etag_list_matches(if_none_match, etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+
+    start, length, code = 0, size, status.HTTP_200_OK
+    if range_header is not None and (
+        if_range is None or _etag_strong_match(if_range, etag)
+    ):
+        try:
+            start, end = _parse_single_range(range_header, size)
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                str(exc),
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "ETag": etag,
+                    "Content-Range": f"bytes */{size}",
+                },
+            )
+        length = end - start + 1
+        code = status.HTTP_206_PARTIAL_CONTENT
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+
+    headers["Content-Length"] = str(length)
+    if request.method == "HEAD":  # same metadata as GET, but no payload body
+        return Response(status_code=code, headers=headers)
+    return StreamingResponse(
+        storage.iter_file(path, start, length),
+        status_code=code,
+        headers=headers,
+        media_type="application/octet-stream",
+    )
 
 
 @app.delete("/uploads/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
