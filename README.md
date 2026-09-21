@@ -5,6 +5,7 @@
 - 创建上传会话，按序号接收携带 **SHA-256** 校验的分片
 - 分片**乱序上传、失败重试**均可，重复上传幂等
 - 全部分片校验通过后才**原子合并**（临时文件 + `rename`）为目标文件
+- 完成的文件可直接 **GET 下载**：支持完整下载与单段 `Range`（断点续传），携带以整文件 SHA-256 生成的强 **ETag**
 - 查询接口实时返回**缺失分片列表**与会话状态
 - 元数据存 SQLite、分片存磁盘，**服务重启后可继续未完成会话**
 - 启动时自动初始化存储目录，默认监听 **8000** 端口
@@ -50,6 +51,7 @@ data/
 | PUT    | `/uploads/{id}/chunks/{index}`        | 上传一个分片（原始字节） |
 | GET    | `/uploads/{id}`                       | 查询状态与缺失分片       |
 | POST   | `/uploads/{id}/complete`              | 校验并原子合并           |
+| GET    | `/uploads/{id}/content`               | 下载成品文件（支持 Range） |
 | GET    | `/uploads`                            | 列出所有会话             |
 | DELETE | `/uploads/{id}`                       | 中止会话并清理           |
 | GET    | `/healthz`                            | 健康检查                 |
@@ -132,6 +134,53 @@ curl -X POST http://localhost:8000/uploads/$SID/complete
 
 `complete` 幂等：重复调用返回相同结果。整文件哈希不匹配返回 `422`，会话保持 `uploading`，可修正后重试。
 
+### 5. 下载成品文件（支持 Range / 断点续传）
+
+仅 `completed` 状态的会话可下载；未完成返回 `409`，未知会话返回 `404`。响应始终携带：
+
+- `Accept-Ranges: bytes`
+- 强 **ETag**：以整文件 SHA-256 生成，形如 `"e92f5a7f…"`（合并时即固定）
+- `Content-Length`；区间下载（`206`）另带 `Content-Range: bytes start-end/总长度`
+
+```bash
+# 完整下载（200）
+curl -o video.mp4 http://localhost:8000/uploads/$SID/content
+
+# 指定单段区间（206 Partial Content）
+curl -H 'Range: bytes=0-1048575' -o part.bin \
+  http://localhost:8000/uploads/$SID/content
+
+# 断点续传：curl -C - 会自动补上 Range 请求头
+curl -C - -o video.mp4 http://localhost:8000/uploads/$SID/content
+```
+
+支持的三种单段写法（仅支持**单段**）：
+
+| Range                  | 含义                                   |
+| ---------------------- | -------------------------------------- |
+| `bytes=start-end`      | 第 start 到第 end 字节（闭区间，从 0 计） |
+| `bytes=start-`        | 从 start 到文件尾                       |
+| `bytes=-suffix`       | 文件末尾 suffix 字节                     |
+
+条件请求与错误码：
+
+- `If-None-Match` 命中当前 ETag（弱比较，`W/` 前缀或 `*` 亦可）→ `304 Not Modified`，无响应体：
+
+```bash
+curl -H 'If-None-Match: "e92f5a7f…"' -i \
+  http://localhost:8000/uploads/$SID/content
+```
+
+- `If-Range` 与当前 ETag **不一致**（强比较，弱 ETag 不匹配；HTTP 日期不支持）→ 忽略 `Range`，返回 `200` 完整文件；一致才返回 `206`
+- 多段（`bytes=0-1,3-4`）、语法错误或越界范围 → `416 Requested Range Not Satisfiable`，并携带 `Content-Range: bytes */总长度`：
+
+```http
+HTTP/1.1 416 Requested Range Not Satisfiable
+Content-Range: bytes */3000000
+```
+
+下载时按区间在磁盘上**分块流式读取**（1 MiB 缓冲），不会把整个文件载入内存。
+
 ## 断点续传语义
 
 - 所有状态都在 `DATA_DIR` 内（SQLite + 分片文件），进程重启、容器重建（挂载同一 volume）后，未完成会话自动可用
@@ -145,7 +194,7 @@ pip install -r requirements-dev.txt
 pytest tests/
 ```
 
-测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止。
+测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止、完整/区间下载、ETag 与 304、If-Range 回退、416 越界处理。
 
 ## 客户端示例（Python）
 
@@ -173,4 +222,19 @@ with open(path, "rb") as f:
         r.raise_for_status()
 
 print(requests.post(f"{BASE}/uploads/{sid}/complete").json())
+
+# 下载：完整 / 区间（stream=True 分块落盘，不占大内存）
+with requests.get(f"{BASE}/uploads/{sid}/content", stream=True) as r:
+    r.raise_for_status()
+    with open("downloaded.mp4", "wb") as out:
+        for block in r.iter_content(1024 * 1024):
+            out.write(block)
+
+# 断点续传：从第 1 MiB 开始取剩余部分
+etag = '"e92f5a7f…"'  # 上次响应里的 ETag
+r = requests.get(
+    f"{BASE}/uploads/{sid}/content",
+    headers={"Range": "bytes=1048576-", "If-Range": etag},
+)
+assert r.status_code in (200, 206)  # 206=区间有效；200=文件已变，给的是完整内容
 ```

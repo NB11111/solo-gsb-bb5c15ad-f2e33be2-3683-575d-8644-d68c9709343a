@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 from . import config, db
@@ -42,6 +43,23 @@ def expected_chunk_size(session: sqlite3.Row, index: int) -> int:
 def final_path_for(session: sqlite3.Row) -> Path:
     name = f"{session['id']}_{sanitize_filename(session['filename'])}"
     return config.files_dir() / name
+
+
+def iter_file_range(path: Path, start: int, end: int) -> Iterator[bytes]:
+    """Yield the inclusive byte range [start, end] of `path` in bounded blocks.
+
+    Reads are capped at _COPY_BUFFER, so even a huge range is streamed
+    without ever loading the whole file into memory.
+    """
+    remaining = end - start + 1
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        while remaining > 0:
+            block = fh.read(min(_COPY_BUFFER, remaining))
+            if not block:
+                break  # file shrank underneath us; stop cleanly
+            remaining -= len(block)
+            yield block
 
 
 def reconcile() -> None:

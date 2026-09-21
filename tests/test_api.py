@@ -152,3 +152,150 @@ def test_abort_session():
         assert _put(client, sid, 0, chunks[0]).status_code == 200
         assert client.delete(f"/uploads/{sid}").status_code == 204
         assert client.get(f"/uploads/{sid}").status_code == 404
+
+
+# ---------------------------------------------------------------- downloads
+
+
+def _completed(client: TestClient, data: bytes, chunk_size: int) -> dict:
+    """Upload every chunk of `data`, merge, and return the completed payload."""
+    session = _create(client, data, chunk_size, file_sha256=_sha256(data))
+    sid = session["session_id"]
+    for index, offset in enumerate(range(0, len(data), chunk_size)):
+        assert _put(client, sid, index, data[offset : offset + chunk_size]).status_code == 200
+    done = client.post(f"/uploads/{sid}/complete")
+    assert done.status_code == 200, done.text
+    return done.json()
+
+
+def test_download_full_file_with_etag():
+    with TestClient(app) as client:
+        data = os.urandom(5000)
+        done = _completed(client, data, 1024)
+        sid = done["session_id"]
+        etag = f'"{_sha256(data)}"'
+
+        resp = client.get(f"/uploads/{sid}/content")
+        assert resp.status_code == 200
+        assert resp.content == data
+        assert resp.headers["Accept-Ranges"] == "bytes"
+        assert resp.headers["Content-Length"] == str(len(data))
+        assert resp.headers["ETag"] == etag  # strong validator: "<sha256>"
+        assert "Content-Range" not in resp.headers
+
+        # If-None-Match hit -> 304 with no body; weak form matches too.
+        for header in (etag, f"W/{etag}", f'"{"0" * 64}", {etag}', "*"):
+            cached = client.get(
+                f"/uploads/{sid}/content", headers={"If-None-Match": header}
+            )
+            assert cached.status_code == 304, header
+            assert cached.headers["ETag"] == etag
+            assert cached.content == b""
+
+        # A stale validator gets the full file again.
+        stale = client.get(
+            f"/uploads/{sid}/content", headers={"If-None-Match": f'"{"0" * 64}"'}
+        )
+        assert stale.status_code == 200
+        assert stale.content == data
+
+
+def test_download_single_ranges():
+    with TestClient(app) as client:
+        data = bytes(range(256)) * 20  # 5120 deterministic bytes
+        done = _completed(client, data, 1024)
+        sid = done["session_id"]
+        size = len(data)
+        url = f"/uploads/{sid}/content"
+
+        # bytes=start-end
+        resp = client.get(url, headers={"Range": "bytes=100-199"})
+        assert resp.status_code == 206
+        assert resp.content == data[100:200]
+        assert resp.headers["Content-Range"] == f"bytes 100-199/{size}"
+        assert resp.headers["Content-Length"] == "100"
+        assert resp.headers["Accept-Ranges"] == "bytes"
+        assert resp.headers["ETag"] == f'"{_sha256(data)}"'
+
+        # bytes=start-  (open-ended)
+        resp = client.get(url, headers={"Range": f"bytes={size - 10}-"})
+        assert resp.status_code == 206
+        assert resp.content == data[-10:]
+        assert resp.headers["Content-Range"] == f"bytes {size - 10}-{size - 1}/{size}"
+
+        # bytes=-suffix
+        resp = client.get(url, headers={"Range": "bytes=-25"})
+        assert resp.status_code == 206
+        assert resp.content == data[-25:]
+        assert resp.headers["Content-Range"] == f"bytes {size - 25}-{size - 1}/{size}"
+
+        # Suffix longer than the file selects the whole file (still 206).
+        resp = client.get(url, headers={"Range": "bytes=-999999"})
+        assert resp.status_code == 206
+        assert resp.content == data
+        assert resp.headers["Content-Range"] == f"bytes 0-{size - 1}/{size}"
+
+        # End beyond EOF is clamped.
+        resp = client.get(url, headers={"Range": f"bytes=0-{size + 100}"})
+        assert resp.status_code == 206
+        assert resp.content == data
+        assert resp.headers["Content-Range"] == f"bytes 0-{size - 1}/{size}"
+
+
+def test_download_range_errors_are_416():
+    with TestClient(app) as client:
+        data = os.urandom(1000)
+        done = _completed(client, data, 256)
+        sid = done["session_id"]
+        url = f"/uploads/{sid}/content"
+
+        bad_ranges = [
+            "bytes=0-1,3-4",      # multiple ranges unsupported
+            "bytes=abc",          # garbage
+            "bytes=",             # empty spec
+            "bytes=-",            # neither bound
+            "items=0-1",          # unknown unit
+            "bytes=5-2",          # start > end
+            f"bytes={len(data)}-",   # starts at EOF
+            f"bytes={len(data)}-{len(data) + 9}",  # fully out of bounds
+            "bytes=-0",           # zero-length suffix
+        ]
+        for bad in bad_ranges:
+            resp = client.get(url, headers={"Range": bad})
+            assert resp.status_code == 416, bad
+            assert resp.headers["Content-Range"] == f"bytes */{len(data)}"
+            assert resp.headers["Accept-Ranges"] == "bytes"
+
+
+def test_download_if_range():
+    with TestClient(app) as client:
+        data = os.urandom(2048)
+        done = _completed(client, data, 1024)
+        sid = done["session_id"]
+        url = f"/uploads/{sid}/content"
+        etag = f'"{_sha256(data)}"'
+
+        # Matching If-Range -> the range is honoured.
+        resp = client.get(url, headers={"Range": "bytes=0-9", "If-Range": etag})
+        assert resp.status_code == 206
+        assert resp.content == data[:10]
+
+        # Mismatched / weak / date-valued If-Range -> Range ignored, full 200.
+        for if_range in (f'"{"0" * 64}"', f"W/{etag}", "Wed, 21 Oct 2015 07:28:00 GMT"):
+            resp = client.get(url, headers={"Range": "bytes=0-9", "If-Range": if_range})
+            assert resp.status_code == 200, if_range
+            assert resp.content == data
+            assert "Content-Range" not in resp.headers
+
+
+def test_download_session_state_errors():
+    with TestClient(app) as client:
+        # Unknown session -> 404.
+        assert client.get("/uploads/nope/content").status_code == 404
+
+        # Unfinished session -> 409 (both before and during upload).
+        data, chunks = _make_file(256, total_chunks=2, last_size=256)
+        sid = _create(client, data, 256)["session_id"]
+        assert client.get(f"/uploads/{sid}/content").status_code == 409
+        assert _put(client, sid, 0, chunks[0]).status_code == 200
+        assert client.get(f"/uploads/{sid}/content").status_code == 409

@@ -10,13 +10,20 @@ import shutil
 import threading
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import config, db, storage
 
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+# One byte-range spec: "bytes=<start>-<end>", "<start>-" or "-<suffix>".
+SINGLE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
+# starlette renamed its 416 constant (the old alias now warns); pin our own
+# so the whole supported fastapi/starlette range stays warning-free.
+HTTP_416_RANGE_NOT_SATISFIABLE = 416
 
 # Guards against concurrent merges of the same session.
 _merge_locks: dict[str, threading.Lock] = {}
@@ -71,6 +78,52 @@ def _get_session_or_404(session_id: str):
         if session is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
         return session
+
+
+def _parse_single_range(header: str, size: int) -> tuple[int, int]:
+    """Parse one `bytes` range into an absolute, inclusive [start, end] pair.
+
+    Raises ValueError for everything that must be answered with 416:
+    malformed syntax, multiple ranges, or ranges outside the file.
+    """
+    if "," in header:
+        raise ValueError("multiple ranges are not supported")
+    match = SINGLE_RANGE_RE.match(header.strip())
+    if match is None:
+        raise ValueError("malformed Range header")
+    first, last = match.groups()
+    if first:
+        start = int(first)
+        end = int(last) if last else size - 1
+        if start >= size or start > end:
+            raise ValueError("range not satisfiable")
+        return start, min(end, size - 1)
+    if not last:
+        raise ValueError("malformed Range header")
+    suffix = int(last)
+    if suffix == 0:
+        raise ValueError("range not satisfiable")
+    return max(size - suffix, 0), size - 1
+
+
+def _weak_etag_match(header: str, etag: str) -> bool:
+    """If-None-Match comparison: weak, per RFC 7232 (`W/` prefixes and a
+    `*` member both match the current validator)."""
+    for candidate in header.split(","):
+        candidate = candidate.strip()
+        if candidate == "*":
+            return True
+        if candidate.startswith("W/"):
+            candidate = candidate[2:].strip()
+        if candidate == etag:
+            return True
+    return False
+
+
+def _strong_etag_match(header: str, etag: str) -> bool:
+    """If-Range comparison: strong, per RFC 7233. Weak tags never match,
+    and HTTP dates never match because we don't emit Last-Modified."""
+    return header.strip() == etag
 
 
 # ---------------------------------------------------------------- endpoints
@@ -258,6 +311,68 @@ def complete_session(session_id: str) -> dict:
             )
     finally:
         lock.release()
+
+
+@app.get("/uploads/{session_id}/content")
+def download_content(
+    session_id: str,
+    range_header: str | None = Header(default=None, alias="Range"),
+    if_none_match: str | None = Header(default=None),
+    if_range: str | None = Header(default=None),
+):
+    """Download the merged file (200) or a single byte range (206).
+
+    The ETag is a strong validator built from the file's SHA-256, fixed at
+    merge time. `If-None-Match` hits are answered 304; a non-matching
+    `If-Range` makes us ignore `Range` and send the full file. Multi-range
+    requests, malformed syntax and out-of-bounds ranges get 416 with
+    `Content-Range: bytes */<size>`. The payload is streamed from disk in
+    bounded blocks, never loaded into memory whole.
+    """
+    with db.connect() as conn:
+        session = db.get_session(conn, session_id)
+    if session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    if session["status"] != "completed" or not session["final_path"]:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "session is not completed; upload all chunks and POST /complete first",
+        )
+    path = Path(session["final_path"])
+    if not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "merged file is missing on disk")
+
+    size = path.stat().st_size
+    etag = f'"{session["file_sha256"]}"'
+    cache_headers = {"ETag": etag, "Accept-Ranges": "bytes"}
+
+    if if_none_match is not None and _weak_etag_match(if_none_match, etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=cache_headers)
+
+    start, end = 0, size - 1
+    partial = False
+    if range_header is not None and (
+        if_range is None or _strong_etag_match(if_range, etag)
+    ):
+        try:
+            start, end = _parse_single_range(range_header, size)
+            partial = True
+        except ValueError as exc:
+            raise HTTPException(
+                HTTP_416_RANGE_NOT_SATISFIABLE,
+                detail=str(exc),
+                headers={**cache_headers, "Content-Range": f"bytes */{size}"},
+            )
+
+    headers = {**cache_headers, "Content-Length": str(end - start + 1)}
+    if partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    return StreamingResponse(
+        storage.iter_file_range(path, start, end),
+        status_code=status.HTTP_206_PARTIAL_CONTENT if partial else status.HTTP_200_OK,
+        headers=headers,
+        media_type="application/octet-stream",
+    )
 
 
 @app.delete("/uploads/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
